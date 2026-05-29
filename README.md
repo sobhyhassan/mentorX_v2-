@@ -132,8 +132,16 @@ source .venv/bin/activate
 ```
 
 ### 4️⃣ Install Dependencies
+Use the dependency manager configured in `pyproject.toml`.
+
 ```bash
-pip install -r requirements.txt
+python -m pip install .
+```
+
+If you use `uv`, install from the lockfile:
+
+```bash
+uv install
 ```
 
 ### 5️⃣ Setup Environment Variables

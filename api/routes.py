@@ -81,12 +81,20 @@ async def health(request: Request):
         except Exception:
             info["vector_store"] = {"error": "unavailable"}
 
+        if hasattr(retriever, "semantic_cache"):
+            info["semantic_cache"] = {
+                "cache_size": len(retriever.semantic_cache.cache),
+                "cache_hits": retriever.semantic_cache.hits,
+                "cache_misses": retriever.semantic_cache.misses,
+                "cache_max_size": retriever.semantic_cache.max_size,
+            }
+
     return info
 
 
 @router.post("/chat")
 @limiter.limit("20/minute")
-async def chat(request: ChatRequest, retriever=Depends(get_retriever)):
+async def chat(request: ChatRequest, retriever=Depends(get_retriever), debug: bool = False):
     question = _sanitize_question(request.question)
     start_time = _time.perf_counter()
     try:
@@ -100,12 +108,17 @@ async def chat(request: ChatRequest, retriever=Depends(get_retriever)):
         )
 
     response_time_ms = (_time.perf_counter() - start_time) * 1000
-    return {
+    response = {
         "question": question,
         "answer": result["answer"],
         "sources": result["sources"],
         "response_time_ms": round(response_time_ms, 2),
     }
+
+    if debug:
+        response["hallucination"] = result.get("hallucination")
+
+    return response
 
 
 @router.post("/chat/stream")
@@ -177,6 +190,8 @@ def _prepare_streaming_context(retriever, question: str) -> dict:
         from retrieval.retriever import (
             _build_context,
             _normalize_query,
+            _query_rewrite,
+            _prepare_cache_key,
             _reject_empty_query,
             _rerank,
         )
@@ -186,8 +201,19 @@ def _prepare_streaming_context(retriever, question: str) -> dict:
         if _reject_empty_query(question):
             return {"error": "Empty question"}
 
-        docs_with_scores = retriever.hybrid_retriever.search(question, k=8)
-        ranked_results = _rerank(docs_with_scores, question)
+        rewritten_query = _query_rewrite(question)
+        query_embedding = retriever.embeddings.embed_query(rewritten_query)
+        cache_key = _prepare_cache_key(rewritten_query)
+        cached_results = retriever.semantic_cache.get(cache_key, query_embedding)
+
+        if cached_results is not None:
+            docs_with_scores = cached_results
+            logger.info("Streaming using semantic cache for query.")
+        else:
+            docs_with_scores = retriever.hybrid_retriever.search(rewritten_query, k=8)
+            retriever.semantic_cache.set(cache_key, query_embedding, docs_with_scores)
+
+        ranked_results = _rerank(docs_with_scores, rewritten_query)
 
         if not ranked_results:
             return {"error": "No relevant context found"}

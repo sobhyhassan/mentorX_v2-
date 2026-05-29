@@ -1,7 +1,10 @@
 import logging
 import re
 import time
+from collections import OrderedDict
 from typing import List, Optional, Tuple
+
+import numpy as np
 
 try:
     from langchain_core.prompts import ChatPromptTemplate
@@ -19,19 +22,24 @@ except ImportError:
 
 from vectorStore.chroma_store import VectorStoreManager
 from config.settings import (
+    CACHE_MAX_SIZE,
+    CACHE_SIMILARITY_THRESHOLD,
+    ENABLE_HYDE,
+    FINAL_TOP_K,
     GROQ_API_KEY,
-    OPENAI_API_KEY,
-    OPENAI_MODEL,
+    GROQ_MODEL,
     LLM_MODEL,
     LLM_TEMPERATURE,
-    TOP_K_RESULTS,
-    MIN_RELEVANCE_SCORE,
-    FINAL_TOP_K,
     MAX_CONTEXT_CHARS,
     MAX_CONTEXT_TOKENS,
+    MIN_RELEVANCE_SCORE,
+    OPENAI_API_KEY,
+    OPENAI_MODEL,
+    TOP_K_RESULTS,
+    HALLUCINATION_THRESHOLD,
 )
 
-from utils.models import get_reranker
+from utils.models import SingletonEmbeddings, get_reranker
 
 try:
     import tiktoken
@@ -100,6 +108,108 @@ def _normalize_chunk_text(text: str) -> str:
 
 def _reject_empty_query(query: str) -> bool:
     return not bool(query)
+
+
+def _query_rewrite(query: str) -> str:
+    """Rewrite the query for better retrieval using HyDE-style expansion."""
+    if not ENABLE_HYDE or not _HAS_OPENAI or not OPENAI_API_KEY:
+        return query
+
+    rewritten = query
+    try:
+        prompt = (
+            "Rewrite the following question so it is more explicit and retrieval-friendly. "
+            "Do not add new facts and keep the meaning unchanged.\n\n"
+            f"Question: {query}\n"
+            "Rewritten question:"
+        )
+
+        llm = OpenAI(
+            model_name=OPENAI_MODEL,
+            temperature=0.0,
+            openai_api_key=OPENAI_API_KEY,
+        )
+        response = llm.generate([prompt])
+        rewritten = response.generations[0][0].text.strip()
+        if rewritten:
+            logger.debug("HyDE query rewrite: %s -> %s", query, rewritten)
+        else:
+            rewritten = query
+    except Exception:
+        logger.debug("HyDE rewrite failed, using original query.")
+        rewritten = query
+
+    return rewritten
+
+
+def _semantic_similarity(a: list[float], b: list[float]) -> float:
+    a_arr = np.asarray(a, dtype=np.float32)
+    b_arr = np.asarray(b, dtype=np.float32)
+    if np.linalg.norm(a_arr) == 0 or np.linalg.norm(b_arr) == 0:
+        return 0.0
+    return float(np.dot(a_arr, b_arr) / (np.linalg.norm(a_arr) * np.linalg.norm(b_arr)))
+
+
+def _token_set(text: str) -> set[str]:
+    return set(re.findall(r"\b\w+\b", text.lower()))
+
+
+def _detect_hallucination(answer: str, context: str, threshold: float = HALLUCINATION_THRESHOLD) -> dict:
+    if not answer or not context:
+        return {
+            "faithfulness_score": 0.0,
+            "hallucination_flag": True,
+            "hallucination_threshold": threshold,
+        }
+
+    answer_tokens = _token_set(answer)
+    context_tokens = _token_set(context)
+    if not answer_tokens:
+        return {
+            "faithfulness_score": 0.0,
+            "hallucination_flag": True,
+            "hallucination_threshold": threshold,
+        }
+
+    overlap = len(answer_tokens & context_tokens) / len(answer_tokens)
+    return {
+        "faithfulness_score": round(overlap, 4),
+        "hallucination_flag": overlap < threshold,
+        "hallucination_threshold": threshold,
+    }
+
+
+def _prepare_cache_key(query: str) -> str:
+    return _normalize_query(query).lower()
+
+
+class SemanticCache:
+    def __init__(self, max_size: int = CACHE_MAX_SIZE, similarity_threshold: float = CACHE_SIMILARITY_THRESHOLD):
+        self.cache: OrderedDict[str, tuple[list[tuple[Document, float]], list[float]]] = OrderedDict()
+        self.max_size = max_size
+        self.similarity_threshold = similarity_threshold
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key: str, query_embedding: list[float]) -> Optional[list[tuple[Document, float]]]:
+        for existing_key, (results, embedding) in self.cache.items():
+            similarity = _semantic_similarity(query_embedding, embedding)
+            if similarity >= self.similarity_threshold:
+                self.cache.move_to_end(existing_key)
+                self.hits += 1
+                logger.info("Semantic cache hit (sim=%.4f) for key=%s", similarity, existing_key)
+                return results
+        self.misses += 1
+        logger.info("Semantic cache miss for key=%s", key)
+        return None
+
+    def set(self, key: str, query_embedding: list[float], results: list[tuple[Document, float]]) -> None:
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        self.cache[key] = (results, query_embedding)
+        if len(self.cache) > self.max_size:
+            removed = self.cache.popitem(last=False)
+            logger.debug("Semantic cache evicted oldest entry: %s", removed[0])
 
 
 # ── Reranking ─────────────────────────────────────────────────
@@ -396,6 +506,8 @@ class MentorRetriever:
 
         # ── Output Parser ─────────────────────────
         self.parser = StrOutputParser()
+        self.embeddings = SingletonEmbeddings()
+        self.semantic_cache = SemanticCache()
 
         # 🔥 Build chain ONCE
         self.chain = PROMPT | self.llm | self.parser
@@ -425,12 +537,22 @@ class MentorRetriever:
             question[:80]
         )
 
-        # ── Step 1: Retrieval ─────────────────────
+        # ── Step 1: Query rewrite + semantic cache ─────
+        rewritten_query = _query_rewrite(question)
+        query_embedding = self.embeddings.embed_query(rewritten_query)
+        cache_key = _prepare_cache_key(rewritten_query)
+        cached_results = self.semantic_cache.get(cache_key, query_embedding)
+
         retrieval_start = time.perf_counter()
-        docs_with_scores = self.hybrid_retriever.search(
-            question,
-            k=k
-        )
+        if cached_results is not None:
+            docs_with_scores = cached_results
+            logger.info("Using semantic cache for query.")
+        else:
+            docs_with_scores = self.hybrid_retriever.search(
+                rewritten_query,
+                k=k
+            )
+            self.semantic_cache.set(cache_key, query_embedding, docs_with_scores)
         retrieval_latency = time.perf_counter() - retrieval_start
         logger.info("Retrieval latency: %.3fs", retrieval_latency)
 
@@ -438,7 +560,7 @@ class MentorRetriever:
         rerank_start = time.perf_counter()
         ranked_results = _rerank(
             docs_with_scores,
-            question
+            rewritten_query
         )
         reranking_latency = time.perf_counter() - rerank_start
         logger.info("Reranking latency: %.3fs", reranking_latency)
@@ -480,6 +602,14 @@ class MentorRetriever:
         logger.info("LLM generation latency: %.3fs", llm_latency)
         logger.info("Total pipeline latency: %.3fs", total_latency)
 
+        hallucination = _detect_hallucination(answer, context)
+        if hallucination["hallucination_flag"]:
+            logger.warning(
+                "Potential hallucination detected: faithfulness=%.4f threshold=%.4f",
+                hallucination["faithfulness_score"],
+                hallucination["hallucination_threshold"],
+            )
+
         # ── Step 6: Sources ───────────────────────
         sources = [
             {
@@ -499,5 +629,6 @@ class MentorRetriever:
         return {
             "answer": answer,
             "sources": sources,
-            "context": context
+            "context": context,
+            "hallucination": hallucination,
         }

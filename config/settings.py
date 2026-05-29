@@ -47,6 +47,10 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 LLM_MODEL = GROQ_MODEL
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", 0.2))
+ENABLE_HYDE = os.getenv("ENABLE_HYDE", "false").strip().lower() in ("1", "true", "yes")
+HALLUCINATION_THRESHOLD = float(os.getenv("HALLUCINATION_THRESHOLD", 0.45))
+CACHE_SIMILARITY_THRESHOLD = float(os.getenv("CACHE_SIMILARITY_THRESHOLD", 0.90))
+CACHE_MAX_SIZE = int(os.getenv("CACHE_MAX_SIZE", 128))
 
 # ── API Authentication ────────────────────────────────────────
 MENTOR_API_KEY = os.getenv("MENTOR_API_KEY", "")
