@@ -1,0 +1,49 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Package and build artifacts
+build/
+dist/
+pip-wheel-metadata/
+*.egg-info/
+*.egg
+
+# Local environment and secret config
+.env
+.env.local
+.env.*.local
+
+# Database and generated storage
+vectorStore/chroma_db/
+*.sqlite3
+dataIngestion/pdf_data/
+logs/
+*.log
+
+# IDE/editor settings
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.user
+*.userosscache
+*.sln.docstates
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python version manager
+.python-version
