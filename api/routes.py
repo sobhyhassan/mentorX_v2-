@@ -5,17 +5,38 @@ import re
 import time as _time
 from typing import AsyncGenerator
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Security
+from fastapi.security import APIKeyHeader
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, constr
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+
+from config.settings import MENTOR_API_KEY
 
 router = APIRouter()
 logger = logging.getLogger("mentor-x-ai.routes")
 
 _start_time = _time.time()
 limiter = Limiter(key_func=get_remote_address)
+
+
+# ── API Key Auth ──────────────────────────────────────────────
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def verify_api_key(api_key: str = Security(_api_key_header)) -> str:
+    """
+    Validate X-API-Key header against MENTOR_API_KEY env variable.
+    If MENTOR_API_KEY is not set, auth is disabled (dev mode).
+    """
+    if not MENTOR_API_KEY:
+        return "dev-mode"
+    if api_key != MENTOR_API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key. Set X-API-Key header.",
+        )
+    return api_key
 
 
 # ── Prompt Injection Protection ───────────────────────────────
@@ -94,7 +115,7 @@ async def health(request: Request):
 
 @router.post("/chat")
 @limiter.limit("20/minute")
-async def chat(request: ChatRequest, retriever=Depends(get_retriever), debug: bool = False):
+async def chat(request: ChatRequest, retriever=Depends(get_retriever), debug: bool = False, _key: str = Depends(verify_api_key)):
     question = _sanitize_question(request.question)
     start_time = _time.perf_counter()
     try:
@@ -123,7 +144,7 @@ async def chat(request: ChatRequest, retriever=Depends(get_retriever), debug: bo
 
 @router.post("/chat/stream")
 @limiter.limit("20/minute")
-async def chat_stream(request: ChatRequest, retriever=Depends(get_retriever)):
+async def chat_stream(request: ChatRequest, retriever=Depends(get_retriever), _key: str = Depends(verify_api_key)):
     """Stream LLM response token by token using Server-Sent Events (SSE)."""
     question = _sanitize_question(request.question)
     start_time = _time.perf_counter()

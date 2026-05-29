@@ -66,6 +66,24 @@ except ImportError:
 
 logger = logging.getLogger("mentor-x-ai.retriever")
 
+# ── HyDE LLM Singleton ────────────────────────────────────────
+# Built once on first use, reused for all subsequent query rewrites.
+_hyde_llm = None
+
+def _get_hyde_llm():
+    """Return a cached OpenAI client for HyDE query rewriting."""
+    global _hyde_llm
+    if _hyde_llm is None:
+        if not _HAS_OPENAI or not OPENAI_API_KEY:
+            return None
+        _hyde_llm = OpenAI(
+            model_name=OPENAI_MODEL,
+            temperature=0.0,
+            openai_api_key=OPENAI_API_KEY,
+        )
+        logger.info("HyDE LLM client initialized (singleton): %s", OPENAI_MODEL)
+    return _hyde_llm
+
 
 # ── Constants ─────────────────────────────────────────────────
 FALLBACK_RESPONSE = (
@@ -124,11 +142,11 @@ def _query_rewrite(query: str) -> str:
             "Rewritten question:"
         )
 
-        llm = OpenAI(
-            model_name=OPENAI_MODEL,
-            temperature=0.0,
-            openai_api_key=OPENAI_API_KEY,
-        )
+        # Reuse the singleton client — no new instance per call
+        llm = _get_hyde_llm()
+        if llm is None:
+            return query
+
         response = llm.generate([prompt])
         rewritten = response.generations[0][0].text.strip()
         if rewritten:
