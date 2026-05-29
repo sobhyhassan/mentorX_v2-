@@ -1,15 +1,44 @@
 import asyncio
 import json
 import logging
-import time
+import re
+import time as _time
 from typing import AsyncGenerator
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, constr
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 router = APIRouter()
 logger = logging.getLogger("mentor-x-ai.routes")
+
+_start_time = _time.time()
+limiter = Limiter(key_func=get_remote_address)
+
+
+# ── Prompt Injection Protection ───────────────────────────────
+INJECTION_PATTERNS = [
+    r"ignore (all |previous |above )?instructions?",
+    r"you are now",
+    r"forget (everything|your instructions)",
+    r"(system|assistant)\s*:",
+    r"<\s*(script|iframe|img)[^>]*>",
+    r"prompt\s*injection",
+]
+
+
+def _sanitize_question(text: str) -> str:
+    """Detect and reject obvious prompt injection attempts."""
+    lower = text.lower()
+    for pattern in INJECTION_PATTERNS:
+        if re.search(pattern, lower):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid input detected.",
+            )
+    return text
 
 
 # ── Models ────────────────────────────────────────────────────
@@ -31,19 +60,38 @@ def get_retriever(request: Request):
 # ── Endpoints ─────────────────────────────────────────────────
 @router.get("/health")
 async def health(request: Request):
-    return {
-        "status": "ok",
+    retriever = getattr(request.app.state, "retriever", None)
+    ready = retriever is not None
+
+    info: dict = {
+        "status": "ok" if ready else "starting",
         "service": "Mentor-X AI",
-        "ready": getattr(request.app.state, "retriever", None) is not None,
+        "ready": ready,
+        "uptime_seconds": round(_time.time() - _start_time, 1),
     }
+
+    if ready:
+        try:
+            store_info = retriever.store.info()
+            info["vector_store"] = {
+                "docs_count": store_info["docs_count"],
+                "collection": store_info["collection"],
+                "embedding_model": store_info["embedding_model"],
+            }
+        except Exception:
+            info["vector_store"] = {"error": "unavailable"}
+
+    return info
 
 
 @router.post("/chat")
+@limiter.limit("20/minute")
 async def chat(request: ChatRequest, retriever=Depends(get_retriever)):
-    start_time = time.perf_counter()
+    question = _sanitize_question(request.question)
+    start_time = _time.perf_counter()
     try:
         # Run retriever.ask() in thread pool to avoid blocking the event loop
-        result = await asyncio.to_thread(retriever.ask, request.question)
+        result = await asyncio.to_thread(retriever.ask, question)
     except Exception:
         logger.exception("Chat request failed")
         raise HTTPException(
@@ -51,9 +99,9 @@ async def chat(request: ChatRequest, retriever=Depends(get_retriever)):
             detail="Failed to process the chat request.",
         )
 
-    response_time_ms = (time.perf_counter() - start_time) * 1000
+    response_time_ms = (_time.perf_counter() - start_time) * 1000
     return {
-        "question": request.question,
+        "question": question,
         "answer": result["answer"],
         "sources": result["sources"],
         "response_time_ms": round(response_time_ms, 2),
@@ -61,13 +109,14 @@ async def chat(request: ChatRequest, retriever=Depends(get_retriever)):
 
 
 @router.post("/chat/stream")
+@limiter.limit("20/minute")
 async def chat_stream(request: ChatRequest, retriever=Depends(get_retriever)):
     """Stream LLM response token by token using Server-Sent Events (SSE)."""
-    start_time = time.perf_counter()
+    question = _sanitize_question(request.question)
+    start_time = _time.perf_counter()
 
     async def generate() -> AsyncGenerator[str, None]:
         try:
-            question = request.question
             logger.info("Streaming chat request: %s", question[:80])
 
             # Retrieve + rerank in thread pool (CPU-bound)
@@ -110,7 +159,7 @@ async def chat_stream(request: ChatRequest, retriever=Depends(get_retriever)):
                 return
 
             # Send sources + timing at the end
-            response_time_ms = (time.perf_counter() - start_time) * 1000
+            response_time_ms = (_time.perf_counter() - start_time) * 1000
             yield f"data: {json.dumps({'sources': sources, 'response_time_ms': round(response_time_ms, 2)})}\n\n"
             yield "data: [DONE]\n\n"
 
@@ -137,7 +186,7 @@ def _prepare_streaming_context(retriever, question: str) -> dict:
         if _reject_empty_query(question):
             return {"error": "Empty question"}
 
-        docs_with_scores = retriever.store.search_with_score(question, k=8)
+        docs_with_scores = retriever.hybrid_retriever.search(question, k=8)
         ranked_results = _rerank(docs_with_scores, question)
 
         if not ranked_results:

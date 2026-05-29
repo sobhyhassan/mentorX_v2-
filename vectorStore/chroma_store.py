@@ -40,6 +40,8 @@ class VectorStoreManager:
             self.persist_directory,
         )
 
+        self._check_embedding_version()
+
     def add_documents(self, chunks: List[Document], allow_append: bool = False) -> None:
         if self.get_collection_count() > 0 and not allow_append:
             logger.warning(
@@ -100,3 +102,37 @@ class VectorStoreManager:
             "persist_directory": self.persist_directory,
             "embedding_model": EMBEDDING_MODEL,
         }
+
+    def _check_embedding_version(self) -> None:
+        """
+        Ensure the stored embedding model matches the current config.
+        Warns loudly if mismatch detected to prevent silent bad results.
+        """
+        try:
+            meta = self.db._collection.metadata or {}
+            stored_model = meta.get("embedding_model")
+
+            if stored_model is None:
+                # First time: store the model name
+                self.db._collection.modify(metadata={"embedding_model": EMBEDDING_MODEL})
+                logger.info("Embedding model version stored: %s", EMBEDDING_MODEL)
+
+            elif stored_model != EMBEDDING_MODEL:
+                logger.error(
+                    "EMBEDDING MODEL MISMATCH! "
+                    "Collection was built with '%s' but current config is '%s'. "
+                    "Results will be WRONG. Delete chroma_db and re-ingest.",
+                    stored_model,
+                    EMBEDDING_MODEL,
+                )
+                raise RuntimeError(
+                    f"Embedding model mismatch: stored='{stored_model}', "
+                    f"current='{EMBEDDING_MODEL}'. Re-index required."
+                )
+            else:
+                logger.info("Embedding model version verified: %s", EMBEDDING_MODEL)
+
+        except RuntimeError:
+            raise
+        except Exception:
+            logger.warning("Could not verify embedding model version", exc_info=True)

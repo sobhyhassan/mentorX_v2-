@@ -37,8 +37,8 @@ FINAL_TOP_K = 3
 
 # ── Context Limits ────────────────────────────────────────────
 # Moved from hardcoded constants in retriever.py
-MAX_CONTEXT_TOKENS = 6000    # Was 1200, now uses 6% of Llama 70B's 128K window
-MAX_CONTEXT_CHARS = 24000    # Was 6000, increased proportionally
+MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", 4000))
+MAX_CONTEXT_CHARS  = int(os.getenv("MAX_CONTEXT_CHARS", 16000))
 
 # ── LLM ──────────────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")

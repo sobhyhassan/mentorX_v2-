@@ -54,13 +54,9 @@ except ImportError:
     _HAS_OPENAI = False
 
 
-# ── Logging ───────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
 
-logger = logging.getLogger("MentorRetriever")
+
+logger = logging.getLogger("mentor-x-ai.retriever")
 
 
 # ── Constants ─────────────────────────────────────────────────
@@ -250,6 +246,101 @@ def _build_context(
     return context
 
 
+# ── Hybrid Retrieval (BM25 + Vector) ──────────────────────────
+class HybridRetriever:
+    """
+    Combines dense vector search with BM25 sparse retrieval.
+    Better for keyword-heavy queries and proper nouns.
+    """
+
+    def __init__(self, store: "VectorStoreManager", alpha: float = 0.7):
+        """
+        alpha: weight for dense retrieval (1-alpha for BM25)
+        """
+        from rank_bm25 import BM25Okapi
+        self._BM25Okapi = BM25Okapi
+        self.store = store
+        self.alpha = alpha
+        self._bm25 = None
+        self._bm25_docs: list = []
+
+    def _build_bm25_index(self) -> None:
+        """Build BM25 index from all documents in the vector store."""
+        try:
+            # Get all docs from chroma
+            results = self.store.db.get(include=["documents", "metadatas"])
+            texts = results.get("documents", [])
+            metadatas = results.get("metadatas", [])
+
+            if not texts:
+                logger.warning("No documents found for BM25 index")
+                return
+
+            self._bm25_docs = [
+                Document(page_content=text, metadata=meta or {})
+                for text, meta in zip(texts, metadatas)
+            ]
+            tokenized = [doc.page_content.lower().split() for doc in self._bm25_docs]
+            self._bm25 = self._BM25Okapi(tokenized)
+            logger.info("BM25 index built with %d documents", len(self._bm25_docs))
+
+        except Exception:
+            logger.exception("Failed to build BM25 index, falling back to dense only")
+
+    def search(self, query: str, k: int = 8) -> list:
+        """Hybrid search: dense + BM25 with score fusion."""
+
+        # Dense retrieval
+        dense_results = self.store.search_with_score(query, k=k)
+
+        # Build BM25 index lazily
+        if self._bm25 is None:
+            self._build_bm25_index()
+
+        if self._bm25 is None or not self._bm25_docs:
+            # Fallback to dense only
+            return dense_results
+
+        # BM25 retrieval
+        tokenized_query = query.lower().split()
+        bm25_scores = self._bm25.get_scores(tokenized_query)
+        top_bm25_idx = sorted(
+            range(len(bm25_scores)),
+            key=lambda i: bm25_scores[i],
+            reverse=True
+        )[:k]
+
+        # Normalize BM25 scores to [0, 1]
+        max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1.0
+        bm25_results = [
+            (self._bm25_docs[i], float(bm25_scores[i]) / max_bm25)
+            for i in top_bm25_idx
+        ]
+
+        # Merge with Reciprocal Rank Fusion (RRF)
+        scores: dict = {}
+        doc_map: dict = {}
+
+        for rank, (doc, _) in enumerate(dense_results):
+            key = doc.page_content[:100]
+            scores[key] = scores.get(key, 0) + self.alpha * (1 / (rank + 1))
+            doc_map[key] = doc
+
+        for rank, (doc, _) in enumerate(bm25_results):
+            key = doc.page_content[:100]
+            scores[key] = scores.get(key, 0) + (1 - self.alpha) * (1 / (rank + 1))
+            doc_map[key] = doc
+
+        # Sort by fused score
+        sorted_keys = sorted(
+            scores,
+            key=lambda k: scores[k],
+            reverse=True
+        )[:k]
+
+        return [(doc_map[key], scores[key]) for key in sorted_keys]
+
+
 # ── Main Retriever ────────────────────────────────────────────
 class MentorRetriever:
 
@@ -261,6 +352,7 @@ class MentorRetriever:
         logger.info("Connecting to vector store...")
 
         self.store = store or VectorStoreManager()
+        self.hybrid_retriever = HybridRetriever(self.store)
 
         # ── LLM ───────────────────────────────────
         if _HAS_GROQ:
@@ -335,7 +427,7 @@ class MentorRetriever:
 
         # ── Step 1: Retrieval ─────────────────────
         retrieval_start = time.perf_counter()
-        docs_with_scores = self.store.search_with_score(
+        docs_with_scores = self.hybrid_retriever.search(
             question,
             k=k
         )
