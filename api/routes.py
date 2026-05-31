@@ -30,6 +30,7 @@ def verify_api_key(api_key: str = Security(_api_key_header)) -> str:
     If MENTOR_API_KEY is not set, auth is disabled (dev mode).
     """
     if not MENTOR_API_KEY:
+        # Auth disabled — log warning once at startup, allow all requests
         return "dev-mode"
     if api_key != MENTOR_API_KEY:
         raise HTTPException(
@@ -115,8 +116,8 @@ async def health(request: Request):
 
 @router.post("/chat")
 @limiter.limit("20/minute")
-async def chat(request: ChatRequest, retriever=Depends(get_retriever), debug: bool = False, _key: str = Depends(verify_api_key)):
-    question = _sanitize_question(request.question)
+async def chat(request: Request, body: ChatRequest, retriever=Depends(get_retriever), debug: bool = False, _key: str = Depends(verify_api_key)):
+    question = _sanitize_question(body.question)
     start_time = _time.perf_counter()
     try:
         # Run retriever.ask() in thread pool to avoid blocking the event loop
@@ -144,9 +145,9 @@ async def chat(request: ChatRequest, retriever=Depends(get_retriever), debug: bo
 
 @router.post("/chat/stream")
 @limiter.limit("20/minute")
-async def chat_stream(request: ChatRequest, retriever=Depends(get_retriever), _key: str = Depends(verify_api_key)):
+async def chat_stream(request: Request, body: ChatRequest, retriever=Depends(get_retriever), _key: str = Depends(verify_api_key)):
     """Stream LLM response token by token using Server-Sent Events (SSE)."""
-    question = _sanitize_question(request.question)
+    question = _sanitize_question(body.question)
     start_time = _time.perf_counter()
 
     async def generate() -> AsyncGenerator[str, None]:
