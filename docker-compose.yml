@@ -1,0 +1,26 @@
+services:
+  mentor-x:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mentor-x-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env                                    # GROQ_API_KEY وغيره هنا
+    volumes:
+      - chroma_data:/app/vectorStore/chroma_db  # vector store يفضل موجود بعد restart
+      - pdf_data:/app/dataIngestion/pdf_data    # حط الـ PDFs هنا
+      - model_cache:/app/.cache                 # HuggingFace models مش بتتحمل كل مرة
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  chroma_data:
+  pdf_data:
+  model_cache:

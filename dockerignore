@@ -1,0 +1,36 @@
+# Git
+.git
+.gitignore
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets — NEVER bake into image
+.env
+*.env
+
+# Data — mounted as Docker volumes at runtime
+vectorStore/chroma_db/
+dataIngestion/pdf_data/
+
+# HuggingFace model cache — mounted as volume
+.cache/
+
+# Dev / tooling only
+uv.lock
+*.md
+evaluation/
+streamlit_dashboard.py
+.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db
